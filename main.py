@@ -33,7 +33,7 @@ Use the audio input to understand the user's spoken thoughts, questions, and ins
 Always refer to the notebook's content when formulating your responses.
 Be proactive in identifying connections, potential next steps, or areas for elaboration based on the visual and textual context.
 Encourage creativity and help the user explore their ideas further within this notebook environment. 
-Never summarize the content on the notebook just for the sake of doing it. Provide new insights based on the contents instead.
+Dont summarize or descrive the content on the notebook unless the user explicitly asks for it. Provide new insights based on the contents instead.
 """
 
 client = genai.Client(
