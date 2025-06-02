@@ -9,7 +9,9 @@ import pyaudio
 import PIL.Image
 import mss
 import remarkable_web_client
-# import rag
+import rag
+import click
+from pynput import keyboard  # Add this import
 
 from markdown_pdf import MarkdownPdf, Section
 
@@ -29,14 +31,28 @@ MODEL = "models/gemini-2.5-flash-preview-native-audio-dialog"
 API_KEY = os.getenv("GEMINI_API_KEY")
 DEFAULT_MODE = "screen"
 
-SYSTEM_INSTRUCTION = """You are a helpful, CONCISE, creative, and critical assistant embedded within a digital writing notebook.
-Your primary focus is the current content of this notebook, including text, diagrams, and doodles.
-Interpret all visual elements, even sketches, as integral parts of the user's work.
-Your goal is to help the user continue their writing and drawing, offering insightful suggestions, critiques, and creative ideas grounded in what is already present on the page.
-Use the audio input to understand the user's spoken thoughts, questions, and instructions, treating it as a supplement to the visual information from the notebook.
-Always refer to the notebook's content when formulating your responses.
-Encourage creativity and help the user explore their ideas further within this notebook environment. 
-Dont summarize or descrive the content on the notebook unless the user explicitly asks for it. Provide new insights based on the contents instead.
+SYSTEM_INSTRUCTION = """You are an intelligent assistant embedded directly within my digital writing notebook. 
+You see what I see on my current page – my text, sketches, diagrams, and doodles – in real-time. You might only see
+parts of the current document as it might have multiple pages and the pages might also be longer than what is shown. 
+We'll communicate primarily through voice; I'll speak my thoughts and questions, and you'll respond with audio.
+
+Your primary function is to be a REACTIVE assistant. This means:
+1.  DO NOT speak or offer suggestions unless I ask you a question or give you a command.
+2.  When I do ask something, be concise and directly address my query.
+
+You have tools to help me:
+-   You can search my other notebooks for relevant information. If I ask a question where searching might be helpful, you can use this tool.
+-   You can create new documents for me. ONLY use this tool if I explicitly ask you to create a document.
+
+Regarding information from tools:
+-   NEVER mention or refer to any document, note, or piece of information unless it was explicitly found and returned by the 'notebook_search' tool in the current interaction. Do not assume or hallucinate the existence of documents.
+-   If a search yields no results, state that clearly.
+-   When referring to another notebook you found, ALWAYS state its name.
+
+Your main role is to help me think, create, and refine my work within this notebook, based on what you see on the current page and what I ask.
+Interpret everything visually, even rough sketches, as part of my creative process when I ask for your input.
+Your goal is to be a helpful, CONCISE, creative, and critical partner, encouraging me to explore ideas further and enhance my work directly within this notebook environment, but only when prompted.
+Avoid summarizing or describing the content unless I specifically ask. Instead, provide new insights or perspectives based on what you see and hear, in response to my questions.
 """
 
 
@@ -49,6 +65,8 @@ except Exception as e:
         f"Error: {e}"
     )
     exit(1)
+
+db = rag.get_db()
 
 
 def create_document(document_name: str, markdown_text: str) -> dict:
@@ -86,50 +104,88 @@ def create_document(document_name: str, markdown_text: str) -> dict:
         return {"status": "error", "message": error_message, "filename": output_filename}
 
 
-create_document_func = types.FunctionDeclaration(
-    name="create_document",
-    description="Creates a new document with the given name and markdown content in the user's notebook, then uploads it as a PDF.",
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "document_name": types.Schema(
-                type=types.Type.STRING,
-                description="The desired name for the new document (without file extension).",
-            ),
-            "markdown_text": types.Schema(
-                type=types.Type.STRING,
-                description="The content of the document, formatted as Markdown.",
-            ),
-        },
-        required=["document_name", "markdown_text"],
-    ),
-)
+def notebook_search(search_text: str, top_k: int = 3) -> dict:
+    """Search for a text string in other notebooks using vector similarity.
 
+    This function searches a database of embeddings from other user notebooks.
+    It returns a list of the top_k most relevant text chunks. Only text chunks that
+    are above a certain relevance threshold are returned. It is important to phrase the
+    search_text such that it has rich semantic that we can search for in the other notebooks.
 
-tools = [create_document]
+    Args:
+        search_text: The text to search for.
+        top_k: The maximum number of results to return.
 
-CONFIG = types.LiveConnectConfig(
-    response_modalities=[
-        "AUDIO",
-    ],
-    media_resolution="MEDIA_RESOLUTION_MEDIUM",
-    speech_config=types.SpeechConfig(
-        voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")),
-    ),
-    context_window_compression=types.ContextWindowCompressionConfig(
-        trigger_tokens=25600,
-        sliding_window=types.SlidingWindow(target_tokens=12800),
-    ),
-    tools=tools,
-    system_instruction=SYSTEM_INSTRUCTION,
-)
+    Returns:
+        A dictionary containing the search status and results.
+        Example on success:
+        {
+            "status": "success",
+            "message": "Found 2 relevant snippets.",
+            "results": [
+                {'source_notebook': 'NotebookA', 'snippet': 'Relevant text...', 'page': 1},
+                {'source_notebook': 'NotebookB', 'snippet': 'More relevant text...'}
+            ]
+        }
+        Example on error:
+        {
+            "status": "error",
+            "message": "Error during similarity search: <details>",
+            "results": []
+        }
+        Example if DB not available:
+        {
+            "status": "warning",
+            "message": "Database not available for search.",
+            "results": []
+        }
+    """
+
+    RELEVANCE_THRESHOLD = 0.7
+
+    if not db:
+        return {"status": "warning", "message": "Database not available for search.", "results": []}
+
+    results_list = []
+    try:
+        result = db.similarity_search_with_score(search_text, k=top_k)
+        for doc, score in result:
+            if score > RELEVANCE_THRESHOLD:
+                continue
+            item = {"source_notebook": doc.metadata.get("source", "Unknown source"), "snippet": doc.page_content}
+            if "page" in doc.metadata and doc.metadata["page"] is not None:
+                try:
+                    item["page"] = int(doc.metadata["page"])
+                except ValueError:
+                    # Handle case where page is not a valid integer, or log it
+                    pass
+            results_list.append(item)
+
+        if results_list:
+            return {
+                "status": "success",
+                "message": f"Found {len(results_list)} relevant snippets for '{search_text}'.",
+                "results": results_list,
+            }
+        else:
+            return {
+                "status": "error",
+                "message": "Did not find any relevant snippets for '{search_text}'.",
+            }
+
+    except Exception as e:
+        print(f"Error during similarity search: {e}")  # Keep for server-side logging
+        return {"status": "error", "message": f"Error during similarity search: {str(e)}", "results": []}
+
 
 pya = pyaudio.PyAudio()
 
 
 class AudioVideoLoop:
-    def __init__(self, screen_number=0):
+    def __init__(self, config, model, screen_number=0):
         self.screen_number = screen_number
+        self.config = config
+        self.model = model
 
         self.audio_in_queue = None
         self.out_queue = None
@@ -140,6 +196,10 @@ class AudioVideoLoop:
         self.send_text_task = None
         self.receive_response_task = None
         self.play_audio_task = None
+        self.last_screen_bytes = None
+
+        self.is_sending_active = False  # Start with sending deactivated
+        self.keyboard_listener_instance = None  # For managing the listener lifecycle
 
     async def send_text(self):
         while True:
@@ -156,32 +216,49 @@ class AudioVideoLoop:
     def _get_screen(self):
         sct = mss.mss()
         if self.screen_number >= len(sct.monitors):
-            raise Exception("Requested screen number not available")
+            # Consider logging this instead of raising an exception in a continuous loop
+            click.echo(f"Error: Requested screen number {self.screen_number} not available.", err=True)
+            return None
         monitor = sct.monitors[self.screen_number]
 
         i = sct.grab(monitor)
 
-        mime_type = "image/jpeg"
-        image_bytes = mss.tools.to_png(i.rgb, i.size)
-        img = PIL.Image.open(io.BytesIO(image_bytes))
+        png_image_bytes = mss.tools.to_png(i.rgb, i.size)
 
+        if png_image_bytes == self.last_screen_bytes:
+            return None  # Screen has not changed
+
+        self.last_screen_bytes = png_image_bytes  # Update last screen
+
+        img = PIL.Image.open(io.BytesIO(png_image_bytes))
         image_io = io.BytesIO()
-        img.save(image_io, format="jpeg")
-        img.save("screen.jpeg", format="jpeg")
+        img.save(image_io, format="jpeg", quality=85)
+        # img.save("screen.jpeg", format="jpeg", quality=85) # For debugging
         image_io.seek(0)
+        jpeg_image_bytes_for_payload = image_io.read()
 
-        image_bytes = image_io.read()
-        return {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode()}
+        mime_type = "image/jpeg"
+        return {"mime_type": mime_type, "data": base64.b64encode(jpeg_image_bytes_for_payload).decode()}
 
     async def get_screen(self):
         while True:
-            frame = await asyncio.to_thread(self._get_screen)
-            if frame is None:
-                break
+            if not self.is_sending_active:
+                await asyncio.sleep(0.1)  # Check frequently if sending becomes active
+                # Reset last_screen_bytes so the first frame after activation is always sent
+                if self.last_screen_bytes is not None:
+                    self.last_screen_bytes = None
+                continue
 
-            await asyncio.sleep(1.0)
+            # Sending is active
+            try:
+                frame = await asyncio.to_thread(self._get_screen)  # _get_screen handles change detection
 
-            await self.out_queue.put(frame)
+                if frame:  # frame is not None if screen changed
+                    await self.out_queue.put(frame)
+            except Exception as e:
+                click.echo(f"Error in _get_screen: {e}", err=True)
+
+            await asyncio.sleep(1.0)  # Interval to check for screen changes when active
 
     async def send_realtime(self):
         while True:
@@ -210,13 +287,30 @@ class AudioVideoLoop:
             kwargs = {"exception_on_overflow": False}
         else:
             kwargs = {}
+
+        click.echo("Audio listener started. Press SPACE to toggle sending audio/video.")
+
         while True:
+            if not self.is_sending_active:  # Check the flag
+                await asyncio.sleep(0.1)  # Sleep briefly and re-check
+                continue
+
+            # Sending is active
             if self.is_ai_speaking:
                 await asyncio.sleep(0.05)
                 continue
 
-            data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
-            await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
+            try:
+                data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
+                await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
+            except IOError as e:
+                # This can happen if the stream is closed, e.g. during shutdown
+                if self.audio_stream and not self.audio_stream.is_stopped():  # type: ignore
+                    click.echo(f"Audio read error: {e}", err=True)
+                break  # Exit loop if stream error
+            except Exception as e:
+                click.echo(f"Unexpected error in listen_audio: {e}", err=True)
+                break
 
     async def receive_response(self):
         "Background task to reads from the websocket and write pcm chunks to the output queue"
@@ -232,8 +326,6 @@ class AudioVideoLoop:
                     continue
                 if text := response.text:
                     print(text, end="")
-
-                print(response)
 
                 if response.tool_call:
                     tool_responses_for_model = []
@@ -252,9 +344,9 @@ class AudioVideoLoop:
                                 function_execution_result = actual_function_to_call(**args)
 
                                 api_tool_response_data = function_execution_result
-                                print(
-                                    f"[Function Call Successful]: {name} -> Response to model: {api_tool_response_data}"
-                                )
+                                # print(
+                                #     f"[Function Call Successful]: {name} -> Response to model: {api_tool_response_data}"
+                                # )
 
                             else:
                                 error_message = (
@@ -275,7 +367,7 @@ class AudioVideoLoop:
 
                     if tool_responses_for_model:
                         await self.session.send_tool_response(function_responses=tool_responses_for_model)
-                        print(f"[INFO] Sent {len(tool_responses_for_model)} tool response(s).")
+                        # print(f"[INFO] Sent {len(tool_responses_for_model)} tool response(s).")
 
             self.is_ai_speaking = False
             # If you interrupt the model, it sends a turn_complete.
@@ -297,16 +389,46 @@ class AudioVideoLoop:
             bytestream = await self.audio_in_queue.get()
             await asyncio.to_thread(stream.write, bytestream)
 
+    def _on_key_press(self, key):
+        try:
+            if key == keyboard.Key.space:
+                if self.is_sending_active:
+                    click.echo("Stopped")
+                    self.is_sending_active = False
+                else:
+                    click.echo("Start streaming .... ", nl=False)
+                    self.is_sending_active = True
+
+        except AttributeError:
+            pass  # Ignore other key presses (e.g. regular character keys)
+
+    async def start_keyboard_listener(self):
+        """Runs the pynput keyboard listener in a separate thread."""
+
+        def listener_thread_target():
+            # self.keyboard_listener_instance is set here so it can be stopped
+            with keyboard.Listener(on_press=self._on_key_press) as listener:
+                self.keyboard_listener_instance = listener
+                listener.join()  # This blocks until listener.stop() is called
+            self.keyboard_listener_instance = None  # Clear it after stopping
+            click.echo("Keyboard listener stopped.")
+
+        # Run the listener in a separate thread managed by asyncio
+        await asyncio.to_thread(listener_thread_target)
+
     async def run(self):
         try:
             async with (
-                client.aio.live.connect(model=MODEL, config=CONFIG) as session,
+                client.aio.live.connect(model=self.model, config=self.config) as session,
                 asyncio.TaskGroup() as tg,
             ):
                 self.session = session
 
                 self.audio_in_queue = asyncio.Queue()
-                self.out_queue = asyncio.Queue(maxsize=5)
+                self.out_queue = asyncio.Queue(maxsize=10)  # Increased size slightly
+
+                # Start the keyboard listener
+                tg.create_task(self.start_keyboard_listener())
 
                 send_text_task = tg.create_task(self.send_text())
                 tg.create_task(self.send_realtime())
@@ -316,16 +438,106 @@ class AudioVideoLoop:
                 tg.create_task(self.receive_response())
                 tg.create_task(self.play_audio())
 
-                await send_text_task
-                raise asyncio.CancelledError("User requested exit")
+                await send_text_task  # This means loop exits when send_text (e.g. user types 'q') exits
+                # When send_text_task completes, it will trigger cancellation of the TaskGroup
+                # due to exiting the `async with tg` block if not handled otherwise.
+                # To make 'q' in send_text quit the whole app, we can raise CancelledError here.
+                click.echo("Exiting application...")
+                # The TaskGroup will handle cancelling other tasks.
 
         except asyncio.CancelledError:
+            click.echo("Application was cancelled.")
             pass
-        except ExceptionGroup as EG:
-            self.audio_stream.close()
-            traceback.print_exception(EG)
+        except ExceptionGroup as eg:  # TaskGroup raises ExceptionGroup
+            click.echo("An error occurred in one of the tasks:", err=True)
+            for i, exc in enumerate(eg.exceptions):
+                click.echo(f"  Error {i + 1}: {type(exc).__name__}: {exc}", err=True)
+                # traceback.print_exception(type(exc), exc, exc.__traceback__) # For more detail
+        finally:
+            click.echo("Cleaning up resources...")
+            if self.audio_stream and not self.audio_stream.is_stopped():  # type: ignore
+                self.audio_stream.stop_stream()
+                self.audio_stream.close()
+                click.echo("Audio stream closed.")
+
+            if self.keyboard_listener_instance:
+                click.echo("Stopping keyboard listener...")
+                self.keyboard_listener_instance.stop()
+
+            # PyAudio termination is handled globally by pya.terminate() if needed,
+            # but usually individual stream closure is sufficient.
+
+
+@click.command()
+@click.option(
+    "--tools",
+    "selected_tool_names_str",  # Use a different variable name to avoid conflict with the list
+    type=str,
+    help="Comma-separated list of tool names to enable (e.g., 'create_document,notebook_search'). Defaults to all available tools if not provided.",
+    default=None,
+    show_default="all available tools",
+)
+@click.option(
+    "--screen",
+    "screen_number",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Screen number to capture.",
+)
+def main_cli(selected_tool_names_str, screen_number):
+    """
+    Runs the AudioVideoLoop with real-time audio/video streaming to Gemini
+    and configurable tools.
+    """
+    # Define all available tools with their string names as keys
+    available_tools_map = {
+        "create_document": create_document,
+        "notebook_search": notebook_search,
+        # Add other tools here if you create more
+        # "another_tool": another_tool_function,
+    }
+
+    selected_tool_functions = []
+    if selected_tool_names_str:
+        selected_tool_names_list = [name.strip() for name in selected_tool_names_str.split(",")]
+        for tool_name in selected_tool_names_list:
+            if tool_name in available_tools_map:
+                selected_tool_functions.append(available_tools_map[tool_name])
+            else:
+                click.echo(f"Warning: Tool '{tool_name}' not found in available tools. Skipping.", err=True)
+        if (
+            not selected_tool_functions and selected_tool_names_list
+        ):  # Check if input was given but no valid tools found
+            click.echo("Warning: No valid tools selected via --tools argument. No tools will be enabled.", err=True)
+    else:
+        click.echo(f"No tools are enabled. See uv run main.py --help for more info.")
+
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        media_resolution="MEDIA_RESOLUTION_MEDIUM",
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")),
+        ),
+        context_window_compression=types.ContextWindowCompressionConfig(
+            trigger_tokens=25600,
+            sliding_window=types.SlidingWindow(target_tokens=12800),
+        ),
+        tools=selected_tool_functions,  # Use the selected tool functions
+        system_instruction=SYSTEM_INSTRUCTION,
+    )
+
+    main_loop = AudioVideoLoop(config=config, model=MODEL, screen_number=screen_number)
+    asyncio.run(main_loop.run())
 
 
 if __name__ == "__main__":
-    main = AudioVideoLoop(screen_number=0)
-    asyncio.run(main.run())
+    try:
+        main_cli()
+    except Exception as e:
+        click.echo(f"Unhandled error in main_cli: {e}", err=True)
+        traceback.print_exc()
+    finally:
+        if pya:
+            pya.terminate()  # Terminate PyAudio system
+            click.echo("PyAudio terminated.")

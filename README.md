@@ -7,6 +7,8 @@ This project allows you to share your screen and audio with a Gemini model and r
 *   **macOS:** This application has been tested on macOS.
 *   **uv:** This project uses `uv` for package management. If you don't have `uv` installed, you can install it by following the instructions on the [official uv installation guide](https://github.com/astral-sh/uv#installation).
 *   **Python:** Version 3.13 or higher (as specified in [`pyproject.toml`](pyproject.toml) and [`.python-version`](.python-version)).
+* brew install portaudio
+
 
 ## Getting Started
 
