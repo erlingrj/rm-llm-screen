@@ -9,7 +9,6 @@ import pyaudio
 import PIL.Image
 import mss
 import remarkable_web_client
-import rag
 import click
 from pynput import keyboard  # Add this import
 
@@ -65,8 +64,6 @@ except Exception as e:
         f"Error: {e}"
     )
     exit(1)
-
-db = rag.get_db()
 
 
 def create_document(document_name: str, markdown_text: str) -> dict:
